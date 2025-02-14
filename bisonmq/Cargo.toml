@@ -8,7 +8,7 @@ description = "A Lightweight and Simple Rust Library for Job Queue"
 repository = "https://github.com/Leaf48/BisonMQ"
 keywords = [ "queue", "background-jobs", "redis" ]
 license = "Apache-2.0"
-readme = "README.md"
+readme = "../README.md"
 
 [dependencies]
 redis = "0.28.2"
