@@ -21,3 +21,10 @@ let job_queue: JobQueue = JobQueue::new("redis://127.0.0.1/", queue_key)?;
 // 0.0 means waiting forever
 let result: (String, String) = job_queue.pop_job(0.0);
 ```
+
+Use the listener
+```Rust
+let listen_handler = job_queue.listen(0.0, move |(queue_key, value)| {
+  println!("[Listener] Queue: {}, Job: {}", queue_key, value);
+});
+```
