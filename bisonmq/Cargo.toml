@@ -11,4 +11,5 @@ license = "Apache-2.0"
 readme = "../README.md"
 
 [dependencies]
-redis = "0.28.2"
+redis = { version = "0.28.2", features = ["tokio-comp"] }
+tokio = { version = "1.44.1", features = ["full"] }

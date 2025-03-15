@@ -1,6 +1,7 @@
-use std::{thread, time::Duration};
+use std::{future::Future, thread, time::Duration};
 
-use redis::{Client, Commands, RedisResult};
+use redis::{AsyncCommands, Client, Commands, RedisResult};
+use tokio::{task::JoinHandle, time::sleep};
 
 pub struct JobQueue {
     client: Client,
@@ -36,9 +37,9 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return the current length of queue
-    pub fn push_job(&self, queue_value: &str) -> RedisResult<i64> {
-        let mut conn = self.client.get_connection()?;
-        let len: i64 = conn.lpush(&self.queue_key, queue_value)?;
+    pub async fn push_job(&self, queue_value: &str) -> RedisResult<i64> {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let len: i64 = conn.lpush(&self.queue_key, queue_value).await?;
 
         Ok(len)
     }
@@ -52,10 +53,10 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return a tuple `(queue_key, value)` on success, wrapped in `RedisResult`.
-    pub fn pop_job(&self, timeout: f64) -> RedisResult<(String, String)> {
-        let mut con = self.client.get_connection()?;
+    pub async fn pop_job(&self, timeout: f64) -> RedisResult<(String, String)> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
 
-        let result: (String, String) = con.blpop(&self.queue_key, timeout)?;
+        let result: (String, String) = con.blpop(&self.queue_key, timeout).await?;
 
         Ok(result)
     }
@@ -83,31 +84,33 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return a `JoinHandle<()>` for the listener thread.
-    pub fn listen<F>(&self, timeout: f64, callback: F) -> thread::JoinHandle<()>
+    pub fn listen<F, Fut>(&self, timeout: f64, callback: F) -> JoinHandle<()>
     where
-        F: Fn((String, String)) + Send + 'static,
-        Client: Clone,
+        F: Fn((String, String)) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let client = self.client.clone();
         let queue_key = self.queue_key.clone();
 
-        thread::spawn(move || loop {
-            // attempt to get a connection
-            let mut con = match client.get_connection() {
-                Ok(conn) => conn,
-                Err(err) => {
-                    eprintln!("[Listener] Connection error: {}", err);
-                    thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-            };
+        tokio::spawn(async move {
+            loop {
+                // attempt to get a connection
+                let mut con = match client.get_multiplexed_async_connection().await {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        eprintln!("[Listener] Connection error: {}", err);
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
-            // Execute BLPOP; the callback is called on receiving a new job.
-            match con.blpop(&queue_key, timeout) {
-                Ok(res) => callback(res),
-                Err(err) => {
-                    eprintln!("[Listener] BLPOP Error: {}", err);
-                    thread::sleep(Duration::from_secs(1));
+                // Execute BLPOP; the callback is called on receiving a new job.
+                match con.blpop(&queue_key, timeout).await {
+                    Ok(res) => callback(res).await,
+                    Err(err) => {
+                        eprintln!("[Listener] BLPOP Error: {}", err);
+                        sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
         })
@@ -116,40 +119,42 @@ impl JobQueue {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::mpsc;
+    use tokio::time::sleep;
 
     use super::JobQueue;
 
     /// Test that a single job can be pushed and popped correctly.
-    #[test]
-    fn job_queue_test() {
+    #[tokio::test]
+    async fn job_queue_test() {
         let queue_key = "test_queue_test";
         let queue_value = "test_queue_value";
 
         let job_queue = JobQueue::new("redis://127.0.0.1/", queue_key).unwrap();
         job_queue.del_queue().unwrap();
 
-        let len = job_queue.push_job(&queue_value).unwrap();
+        let len = job_queue.push_job(&queue_value).await.unwrap();
         assert_eq!(len, 1);
 
-        let result = job_queue.pop_job(0.0).unwrap();
+        let result = job_queue.pop_job(0.0).await.unwrap();
 
         println!("{:?}", result);
         assert_eq!(result.1, queue_value)
     }
 
     /// Test that multiple pushing are handled in a separate thread.
-    #[test]
-    fn job_queue_multi_push_test() {
+    #[tokio::test]
+    async fn job_queue_multi_push_test() {
         let queue_key = "test_queue_multi_push";
 
         let job_queue = Arc::new(JobQueue::new("redis://127.0.0.1/", queue_key).unwrap());
         job_queue.del_queue().unwrap();
 
         let consumer_queue = Arc::clone(&job_queue);
-        let consumer_handle = thread::spawn(move || {
+        let consumer_handle = tokio::spawn(async move {
             for i in 0..5 {
-                match consumer_queue.pop_job(0.0) {
+                match consumer_queue.pop_job(0.0).await {
                     Ok(job) => {
                         println!("[Consumer] {}: Queue key - {}, value - {}", i, job.0, job.1)
                     }
@@ -163,34 +168,45 @@ mod tests {
 
             job_queue
                 .push_job(&queue_value)
+                .await
                 .expect("[Producer] Failed to push a job");
 
             println!("[Producer] Pushed {}", queue_value);
-            thread::sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1)).await;
         }
 
-        consumer_handle.join().unwrap();
+        consumer_handle.await.unwrap();
     }
 
     /// Test that the listener functionality.
-    #[test]
-    fn job_queue_listener_test() {
+    #[tokio::test]
+    async fn job_queue_listener_test() {
         let queue_key = "test_queue_listener";
 
         let job_queue = JobQueue::new("redis://127.0.0.1/", queue_key).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(5);
+
         let listen_handler = job_queue.listen(0.0, move |(q, value)| {
-            println!("[Listener] Queue: {}, Job: {}", q, value);
+            let tx = tx.clone();
+            async move {
+                println!("[Listener] Queue: {}, Job: {}", q, value);
+                tx.send(()).await.unwrap();
+            }
         });
 
         for i in 0..5 {
             let new_job = format!("job_number_{}", i);
-            let num = job_queue.push_job(&new_job).unwrap();
+            let num = job_queue.push_job(&new_job).await.unwrap();
             println!("[Producer] Pushed: {}. Current length: {}", new_job, num);
-            thread::sleep(Duration::from_millis(500));
+            sleep(Duration::from_millis(500)).await;
         }
 
-        thread::sleep(Duration::from_secs(1));
+        for _ in 0..5 {
+            rx.recv().await;
+        }
 
-        // listen_handler.join();
+        listen_handler.abort();
+        println!("Test finished after processing 5 jobs.");
     }
 }
