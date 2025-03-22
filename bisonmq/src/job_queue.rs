@@ -20,13 +20,12 @@ impl JobQueue {
     /// Create a new JobQueue instance.
     ///
     /// # Arguments
-    ///
     /// * `redis_url` - The URL to the Redis server (e.g., "redis://127.0.0.1/").
     /// * `queue_key` - The key(name) in Redis that all data will be stored.
     ///
     /// # Returns
-    ///
-    /// Returns a `JobQueue` instance on success, or Redis error on failure.
+    /// * `Ok(JobQueue)`
+    /// * `Err(JobQueueError)` if an error occurs while communicating with Redis
     pub fn new(redis_url: &str, queue_key: &str) -> Result<Self, JobQueueError> {
         let client = Client::open(redis_url)?;
 
@@ -39,15 +38,13 @@ impl JobQueue {
     /// Push a job into the queue
     ///
     /// # Arguments
-    ///
     /// * `queue_value` - The value to push into the queue (e.g. JSON String)
     ///
     /// # Returns
-    ///
-    /// Return the current length of queue
+    /// * `Ok(i64)` the current length of queue, representing the item place.
     pub async fn push_job(&self, queue_value: &str) -> Result<i64, JobQueueError> {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let len: i64 = conn.lpush(&self.queue_key, queue_value).await?;
+        let len: i64 = conn.rpush(&self.queue_key, queue_value).await?;
 
         Ok(len)
     }
@@ -55,12 +52,11 @@ impl JobQueue {
     /// Pop a first element in the queue
     ///
     /// # Arguments
-    ///
     /// * `timeout` - The timeout value in seconds for the BLPOP command (e.g. 0.0 for no limit).
     ///
     /// # Returns
-    ///
-    /// Return a tuple `(queue_key, value)` on success, wrapped in `RedisResult`.
+    /// * `Ok((String, String))` on success, which represents (queue_key, value).
+    /// * `Err(JobQueueError)` on failure
     pub async fn pop_job(&self, timeout: f64) -> Result<(String, String), JobQueueError> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
 
@@ -72,12 +68,12 @@ impl JobQueue {
     /// Reset the entire queue by deleting the queue.
     ///
     /// # Returns
-    ///
-    /// Return Ok(()) on success, or Redis error on failure.
-    pub fn del_queue(&self) -> Result<(), JobQueueError> {
-        let mut con = self.client.get_connection()?;
+    /// * `Ok(())` on success.
+    /// * `Err(JobQueueError)` if an error occurs while communicating with Redis.
+    pub async fn del_queue(&self) -> Result<(), JobQueueError> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
 
-        let _: () = con.del(&self.queue_key)?;
+        let _: () = con.del(&self.queue_key).await?;
 
         Ok(())
     }
@@ -90,8 +86,7 @@ impl JobQueue {
     /// * `callback` - The callback function that takes a tuple `(queue_key, value)`.
     ///
     /// # Returns
-    ///
-    /// Return a `JoinHandle<()>` for the listener thread.
+    /// * `JoinHandle<()>` the listener thread
     pub fn listen<F, Fut>(&self, timeout: f64, callback: F) -> JoinHandle<()>
     where
         F: Fn((String, String)) -> Fut + Send + Sync + 'static,
@@ -123,6 +118,35 @@ impl JobQueue {
             }
         })
     }
+
+    /// Locate the index of the first item in the queue that satisfies the given filter.
+    ///
+    /// The queue stores data as strings (e.g., JSON or any string representation), and the provided closure
+    /// is used to filter these items.
+    ///
+    /// # Arguments
+    /// * `f` - A closure that takes a reference to an item (as &str) and returns `Some(_)` if the item meets the criteria,
+    ///         or `None` otherwise.
+    ///
+    /// # Returns
+    /// * `Ok(Some(index))` if an item that satisfies the filter is found.
+    /// * `Ok(None)` if no matching item is found.
+    /// * `Err(JobQueueError)` if an error occurs while communicating with Redis.
+    pub async fn locate_item<T, F>(&self, f: F) -> Result<Option<usize>, JobQueueError>
+    where
+        F: Fn(&str) -> Option<T>,
+    {
+        let mut conn = self.client.get_multiplexed_async_connection().await?;
+
+        let items: Vec<String> = conn.lrange(&self.queue_key, 0, -1).await?;
+
+        for (index, elm) in items.iter().enumerate() {
+            if let Some(_) = f(elm) {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +164,7 @@ mod tests {
         let queue_value = "test_queue_value";
 
         let job_queue = JobQueue::new("redis://127.0.0.1/", queue_key).unwrap();
-        job_queue.del_queue().unwrap();
+        job_queue.del_queue().await.unwrap();
 
         let len = job_queue.push_job(&queue_value).await.unwrap();
         assert_eq!(len, 1);
@@ -157,7 +181,7 @@ mod tests {
         let queue_key = "test_queue_multi_push";
 
         let job_queue = Arc::new(JobQueue::new("redis://127.0.0.1/", queue_key).unwrap());
-        job_queue.del_queue().unwrap();
+        job_queue.del_queue().await.unwrap();
 
         let consumer_queue = Arc::clone(&job_queue);
         let consumer_handle = tokio::spawn(async move {
@@ -216,5 +240,30 @@ mod tests {
 
         listen_handler.abort();
         println!("Test finished after processing 5 jobs.");
+    }
+
+    #[tokio::test]
+    async fn locate_item_test() {
+        let queue_key = "locate_item";
+        let queue_value = "locate_item_value";
+
+        let job_queue = JobQueue::new("redis://127.0.0.1/", queue_key).unwrap();
+
+        for i in 0..5 {
+            let v = format!("locate_item_value_{}", i);
+            let _ = job_queue.push_job(&v).await.unwrap();
+        }
+
+        let _: i64 = job_queue.push_job(&queue_value).await.unwrap();
+
+        let pos = job_queue
+            .locate_item(|item| if item == queue_value { Some(()) } else { None })
+            .await
+            .unwrap()
+            .unwrap();
+
+        job_queue.del_queue().await.unwrap();
+
+        assert_eq!(pos, 5)
     }
 }
