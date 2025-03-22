@@ -1,7 +1,15 @@
-use std::{future::Future, thread, time::Duration};
+use std::{future::Future, time::Duration};
 
-use redis::{AsyncCommands, Client, Commands, RedisResult};
+use redis::{AsyncCommands, Client, Commands};
+use thiserror::Error;
 use tokio::{task::JoinHandle, time::sleep};
+
+/// JobQueue Error
+#[derive(Debug, Error)]
+pub enum JobQueueError {
+    #[error("Redis Error: {0}")]
+    RedisError(#[from] redis::RedisError),
+}
 
 pub struct JobQueue {
     client: Client,
@@ -19,7 +27,7 @@ impl JobQueue {
     /// # Returns
     ///
     /// Returns a `JobQueue` instance on success, or Redis error on failure.
-    pub fn new(redis_url: &str, queue_key: &str) -> RedisResult<Self> {
+    pub fn new(redis_url: &str, queue_key: &str) -> Result<Self, JobQueueError> {
         let client = Client::open(redis_url)?;
 
         Ok(Self {
@@ -37,7 +45,7 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return the current length of queue
-    pub async fn push_job(&self, queue_value: &str) -> RedisResult<i64> {
+    pub async fn push_job(&self, queue_value: &str) -> Result<i64, JobQueueError> {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         let len: i64 = conn.lpush(&self.queue_key, queue_value).await?;
 
@@ -53,7 +61,7 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return a tuple `(queue_key, value)` on success, wrapped in `RedisResult`.
-    pub async fn pop_job(&self, timeout: f64) -> RedisResult<(String, String)> {
+    pub async fn pop_job(&self, timeout: f64) -> Result<(String, String), JobQueueError> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
 
         let result: (String, String) = con.blpop(&self.queue_key, timeout).await?;
@@ -66,7 +74,7 @@ impl JobQueue {
     /// # Returns
     ///
     /// Return Ok(()) on success, or Redis error on failure.
-    pub fn del_queue(&self) -> RedisResult<()> {
+    pub fn del_queue(&self) -> Result<(), JobQueueError> {
         let mut con = self.client.get_connection()?;
 
         let _: () = con.del(&self.queue_key)?;
